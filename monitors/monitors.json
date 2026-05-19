@@ -1,0 +1,7 @@
+[
+  {
+    "name": "services-watcher",
+    "command": "node \"${CLAUDE_PLUGIN_ROOT}/bin/watcher.js\"",
+    "description": "Stream service crash/exit events into the session"
+  }
+]

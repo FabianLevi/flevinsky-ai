@@ -1,0 +1,7 @@
+{
+  "name": "flevinsky-ai",
+  "owner": { "name": "Fabian Levinsky" },
+  "plugins": [
+    { "name": "flevinsky-ai", "source": "./" }
+  ]
+}

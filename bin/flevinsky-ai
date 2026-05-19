@@ -1,0 +1,309 @@
+#!/usr/bin/env node
+// flevinsky-ai — cross-agent dev-service runner.
+//
+// Subcommands:
+//   run <name> -- <cmd> [args...]   attached: register state and stream output
+//   list                            list declared services + live state
+//   logs <name> [tail]              tail recent log lines
+//   start <name>                    background-spawn a declared service
+//   stop <name>                     terminate a tracked service
+//   restart <name>                  stop + start
+//   path                            print resolved project root and prefix
+//
+// State + logs are written under <root>/<prefix>/services/. The prefix is
+// resolved via fallback: .flevinsky-ai → .services → .pi → .claude.
+
+import { spawn } from "node:child_process";
+import {
+	createWriteStream,
+	existsSync,
+	mkdirSync,
+	readFileSync,
+} from "node:fs";
+import { dirname } from "node:path";
+
+import { findProjectCwd, logPathFor } from "../lib/paths.js";
+import { loadServicesConfig, resolveServiceCwd } from "../lib/config.js";
+import { readState, writeState, STATUS, updateEntry, reconcileStale } from "../lib/state.js";
+import { spawnService, terminateProcess, waitForReadyPattern } from "../lib/process.js";
+import { tailLogFile } from "../lib/logs.js";
+
+const STOP_GRACE_MS = 2_000;
+const READY_TIMEOUT_MS = 30_000;
+const READY_POLL_MS = 200;
+
+function usage(code = 1) {
+	const out = code === 0 ? process.stdout : process.stderr;
+	out.write(
+		`flevinsky-ai — dev service runner\n\n` +
+			`Usage:\n` +
+			`  flevinsky-ai run <name> -- <cmd> [args...]   attached runner\n` +
+			`  flevinsky-ai list                            list declared + live\n` +
+			`  flevinsky-ai logs <name> [tail]              tail logs\n` +
+			`  flevinsky-ai start <name>                    background spawn\n` +
+			`  flevinsky-ai stop <name>                     terminate\n` +
+			`  flevinsky-ai restart <name>                  stop + start\n` +
+			`  flevinsky-ai path                            print resolved root + prefix\n`,
+	);
+	process.exit(code);
+}
+
+function fail(msg, code = 1) {
+	process.stderr.write(`flevinsky-ai: ${msg}\n`);
+	process.exit(code);
+}
+
+function nowIso() {
+	return new Date().toISOString();
+}
+
+function quote(part) {
+	if (/^[A-Za-z0-9_/:=.,@%+-]+$/.test(part)) return part;
+	return `'${part.replaceAll("'", `'\\''`)}'`;
+}
+
+function exitCodeFor(code, signal) {
+	if (typeof code === "number") return code;
+	if (signal === "SIGINT") return 130;
+	if (signal === "SIGTERM") return 143;
+	return 1;
+}
+
+function resolveRoot() {
+	const { cwd, prefix } = findProjectCwd(process.cwd());
+	return { cwd, prefix };
+}
+
+async function cmdRun(args) {
+	const service = args[0];
+	if (!service || args[1] !== "--" || args.length < 3) usage();
+	const cmdArgs = args.slice(2);
+	const { cwd: projectCwd, prefix } = resolveRoot();
+	const cfg = loadServicesConfig(projectCwd, prefix);
+	const svc = cfg.services[service];
+	if (!svc) fail(`unknown service '${service}' in ${cfg.path}`);
+	const serviceCwd = resolveServiceCwd(projectCwd, svc.cwd);
+	const logPath = logPathFor(projectCwd, service, prefix);
+	mkdirSync(dirname(logPath), { recursive: true });
+	const log = createWriteStream(logPath, { flags: "w" });
+
+	const child = spawn(cmdArgs[0], cmdArgs.slice(1), {
+		cwd: serviceCwd,
+		env: { ...process.env, ...svc.env },
+		stdio: ["inherit", "pipe", "pipe"],
+	});
+
+	const displayCmd = cmdArgs.map(quote).join(" ");
+	let settled = false;
+	let requestedSignal = null;
+
+	child.stdout?.on("data", (c) => {
+		process.stdout.write(c);
+		log.write(c);
+	});
+	child.stderr?.on("data", (c) => {
+		process.stderr.write(c);
+		log.write(c);
+	});
+
+	child.once("spawn", () => {
+		writeState(projectCwd, {
+			...readState(projectCwd, prefix),
+			[service]: {
+				pid: child.pid,
+				status: STATUS.RUNNING,
+				kind: svc.kind,
+				cmd: displayCmd,
+				runner: "attached",
+				startedAt: nowIso(),
+			},
+		}, prefix);
+	});
+
+	child.once("error", (err) => {
+		settled = true;
+		log.end();
+		fail(`failed to start '${service}': ${err.message}`);
+	});
+
+	const forward = (sig) => {
+		requestedSignal = sig;
+		try {
+			child.kill(sig);
+		} catch {}
+	};
+	process.once("SIGINT", () => forward("SIGINT"));
+	process.once("SIGTERM", () => forward("SIGTERM"));
+
+	child.once("exit", (code, signal) => {
+		if (settled) return;
+		settled = true;
+		log.end(() => {
+			const state = readState(projectCwd, prefix);
+			const cur = state[service];
+			if (cur && cur.pid === child.pid) {
+				writeState(projectCwd, {
+					...state,
+					[service]: {
+						...cur,
+						status: STATUS.EXITED,
+						exitedAt: nowIso(),
+						exitCode: code ?? undefined,
+						exitSignal: signal ?? requestedSignal ?? undefined,
+					},
+				}, prefix);
+			}
+			process.exit(exitCodeFor(code, signal ?? requestedSignal));
+		});
+	});
+}
+
+function cmdList() {
+	const { cwd, prefix } = resolveRoot();
+	const cfg = loadServicesConfig(cwd, prefix);
+	const state = readState(cwd, prefix);
+	const declared = Object.values(cfg.services);
+	if (declared.length === 0 && Object.keys(state).length === 0) {
+		console.log(`No services. Create ${cfg.path}.`);
+		return;
+	}
+	for (const d of declared) {
+		const e = state[d.name];
+		console.log(
+			`${d.name} (${d.kind})  ${e ? `pid=${e.pid} ${e.status}` : "stopped"}  — ${d.cmd}`,
+		);
+	}
+	for (const [n, e] of Object.entries(state)) {
+		if (cfg.services[n]) continue;
+		console.log(`${n} (?)  pid=${e.pid} ${e.status}  — ${e.cmd ?? ""}`);
+	}
+}
+
+function cmdLogs(args) {
+	const name = args[0];
+	if (!name) usage();
+	const tail = Number.parseInt(args[1] ?? "100", 10) || 100;
+	const { cwd, prefix } = resolveRoot();
+	const { lines, warnings } = tailLogFile(logPathFor(cwd, name, prefix), { tail });
+	for (const w of warnings) process.stderr.write(`warn: ${w}\n`);
+	console.log(lines.length > 0 ? lines.join("\n") : "(no log content)");
+}
+
+async function cmdStart(args) {
+	const name = args[0];
+	if (!name) usage();
+	const { cwd, prefix } = resolveRoot();
+	const cfg = loadServicesConfig(cwd, prefix);
+	const svc = cfg.services[name];
+	if (!svc) fail(`unknown service '${name}' in ${cfg.path}`);
+	const existing = readState(cwd, prefix)[name];
+	if (existing && (existing.status === STATUS.RUNNING || existing.status === STATUS.STARTING)) {
+		console.log(`${name}: already ${existing.status}`);
+		return;
+	}
+	const { child, logPath } = spawnService(cwd, svc, prefix);
+	if (!child.pid) fail(`spawn failed: no pid`);
+	writeState(cwd, {
+		...readState(cwd, prefix),
+		[name]: {
+			pid: child.pid,
+			status: STATUS.STARTING,
+			kind: svc.kind,
+			cmd: svc.cmd,
+			runner: "background",
+			startedAt: nowIso(),
+		},
+	}, prefix);
+	// Detach so the parent exits and the service runs on its own.
+	child.unref();
+	if (svc.kind === "task") {
+		console.log(`${name}: started (task, pid=${child.pid})`);
+		return;
+	}
+	if (svc.readyPattern) {
+		const result = await waitForReadyPattern(logPath, new RegExp(svc.readyPattern), {
+			timeoutMs: READY_TIMEOUT_MS,
+			pollMs: READY_POLL_MS,
+		});
+		const cur = readState(cwd, prefix);
+		if (result.matched && cur[name]?.status === STATUS.STARTING) {
+			writeState(cwd, updateEntry(cur, name, { status: STATUS.RUNNING }), prefix);
+			console.log(`${name}: running (pid=${child.pid})`);
+			return;
+		}
+		await terminateProcess(child.pid, STOP_GRACE_MS);
+		fail(`${name}: readyPattern ${result.reason ?? "no match"}`);
+	}
+	const cur = readState(cwd, prefix);
+	if (cur[name]?.status === STATUS.STARTING) {
+		writeState(cwd, updateEntry(cur, name, { status: STATUS.RUNNING }), prefix);
+	}
+	console.log(`${name}: running (pid=${child.pid})`);
+}
+
+async function cmdStop(args) {
+	const name = args[0];
+	if (!name) usage();
+	const { cwd, prefix } = resolveRoot();
+	const state = readState(cwd, prefix);
+	const entry = state[name];
+	if (!entry) fail(`${name}: not in state`);
+	if (entry.status !== STATUS.RUNNING && entry.status !== STATUS.STARTING) {
+		console.log(`${name}: ${entry.status}`);
+		return;
+	}
+	writeState(cwd, updateEntry(state, name, { status: STATUS.STOPPING }), prefix);
+	await terminateProcess(entry.pid, STOP_GRACE_MS);
+	const cur = readState(cwd, prefix);
+	if (cur[name]) {
+		writeState(cwd, updateEntry(cur, name, {
+			status: STATUS.STOPPED,
+			exitedAt: nowIso(),
+		}), prefix);
+	}
+	console.log(`${name}: stopped`);
+}
+
+async function cmdRestart(args) {
+	await cmdStop(args);
+	await cmdStart(args);
+}
+
+function cmdPath() {
+	const { cwd, prefix } = resolveRoot();
+	console.log(`root:   ${cwd}`);
+	console.log(`prefix: ${prefix}`);
+	const cfg = loadServicesConfig(cwd, prefix);
+	console.log(`config: ${cfg.path}${cfg.missing ? " (missing)" : ""}`);
+}
+
+const argv = process.argv.slice(2);
+if (argv.length === 0 || argv[0] === "-h" || argv[0] === "--help") usage(0);
+const sub = argv[0];
+const rest = argv.slice(1);
+switch (sub) {
+	case "run":
+		await cmdRun(rest);
+		break;
+	case "list":
+	case "ls":
+		cmdList();
+		break;
+	case "logs":
+		cmdLogs(rest);
+		break;
+	case "start":
+		await cmdStart(rest);
+		break;
+	case "stop":
+		await cmdStop(rest);
+		break;
+	case "restart":
+		await cmdRestart(rest);
+		break;
+	case "path":
+		cmdPath();
+		break;
+	default:
+		usage();
+}

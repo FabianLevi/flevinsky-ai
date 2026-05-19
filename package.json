@@ -1,0 +1,51 @@
+{
+  "name": "flevinsky-ai",
+  "version": "0.1.0",
+  "description": "Cross-agent dev service runner + Claude Code plugin + Pi extension",
+  "type": "module",
+  "bin": {
+    "flevinsky-ai": "bin/flevinsky-ai",
+    "pi-services": "adapters/pi/bin/pi-services.mjs"
+  },
+  "pi": {
+    "extensions": ["./adapters/pi/extensions"]
+  },
+  "files": [
+    "bin",
+    "lib",
+    "hooks",
+    "monitors",
+    "scripts",
+    "skills",
+    "adapters",
+    "docs",
+    ".mcp.json",
+    ".claude-plugin",
+    "AGENTS.md",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "packageManager": "pnpm@11.1.1",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/FabianLevi/flevinsky-ai.git"
+  },
+  "license": "MIT",
+  "author": "Fabian Levinsky",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": { "optional": true },
+    "@earendil-works/pi-tui": { "optional": true },
+    "typebox": { "optional": true }
+  }
+}

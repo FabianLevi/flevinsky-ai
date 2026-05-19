@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "pnpm"
+
+      - name: Install deps
+        run: pnpm install --frozen-lockfile
+
+      - name: Syntax-check JS entrypoints
+        run: |
+          node --check bin/flevinsky-ai
+          node --check bin/server.js
+          node --check bin/watcher.js
+          node --check scripts/session-start.js
+          node --check scripts/session-end.js
+          node --check adapters/pi/bin/pi-services.mjs
+
+      - name: Validate JSON manifests
+        run: |
+          for f in package.json .mcp.json .claude-plugin/plugin.json .claude-plugin/marketplace.json hooks/hooks.json monitors/monitors.json; do
+            node -e "JSON.parse(require('fs').readFileSync('$f','utf8'))" && echo "ok: $f"
+          done
+
+      - name: Shellcheck install.sh
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          shellcheck scripts/install.sh bin/statusline.sh scripts/session-start.sh scripts/session-end.sh scripts/prompt-submit.sh
+
+      - name: Smoke-test runner CLI
+        run: |
+          mkdir -p /tmp/fl-ci/.flevinsky-ai
+          echo '{"services":{"hello":{"kind":"task","cmd":"echo hi"}}}' > /tmp/fl-ci/.flevinsky-ai/services.json
+          cd /tmp/fl-ci
+          node $GITHUB_WORKSPACE/bin/flevinsky-ai path
+          node $GITHUB_WORKSPACE/bin/flevinsky-ai list

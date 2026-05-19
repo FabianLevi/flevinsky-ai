@@ -1,0 +1,90 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+          cache: "pnpm"
+
+      - name: Verify tag matches package.json
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg=$(node -p "require('./package.json').version")
+          if [ "$tag" != "$pkg" ]; then
+            echo "::error::tag ($tag) does not match package.json version ($pkg)"; exit 1
+          fi
+
+      - name: Publish to npm
+        run: pnpm publish --access public --no-git-checks
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Compute tarball sha256
+        id: sha
+        run: |
+          ver=$(node -p "require('./package.json').version")
+          url="https://registry.npmjs.org/flevinsky-ai/-/flevinsky-ai-${ver}.tgz"
+          for i in 1 2 3 4 5; do
+            if curl -fsLO "$url"; then break; fi
+            echo "npm not yet serving tarball, retry $i"; sleep 5
+          done
+          sum=$(shasum -a 256 "flevinsky-ai-${ver}.tgz" | awk '{print $1}')
+          echo "sum=$sum"   >> "$GITHUB_OUTPUT"
+          echo "url=$url"   >> "$GITHUB_OUTPUT"
+          echo "ver=$ver"   >> "$GITHUB_OUTPUT"
+
+      - name: Checkout homebrew-tap
+        uses: actions/checkout@v4
+        with:
+          repository: FabianLevi/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-tap
+
+      - name: Update formula
+        working-directory: homebrew-tap
+        run: |
+          mkdir -p Formula
+          cat > Formula/flevinsky-ai.rb <<EOF
+          class FlevinskyAi < Formula
+            desc "Cross-agent dev service runner + Claude Code plugin + Pi extension"
+            homepage "https://github.com/FabianLevi/flevinsky-ai"
+            url "${{ steps.sha.outputs.url }}"
+            sha256 "${{ steps.sha.outputs.sum }}"
+            version "${{ steps.sha.outputs.ver }}"
+            license "MIT"
+
+            depends_on "node"
+
+            def install
+              system "npm", "install", "-g", "--prefix=#{libexec}", "flevinsky-ai@#{version}"
+              bin.install_symlink Dir["#{libexec}/bin/*"]
+            end
+
+            test do
+              system "#{bin}/flevinsky-ai", "--help"
+            end
+          end
+          EOF
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/flevinsky-ai.rb
+          git commit -m "chore: flevinsky-ai ${{ steps.sha.outputs.ver }}"
+          git push

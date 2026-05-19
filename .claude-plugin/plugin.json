@@ -1,0 +1,5 @@
+{
+  "name": "flevinsky-ai",
+  "version": "0.1.0",
+  "description": "Declare, run, and observe long-running dev services across Claude Code, Pi, and other agents"
+}

@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "flevinsky-ai": {
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/bin/server.js"]
+    }
+  }
+}
