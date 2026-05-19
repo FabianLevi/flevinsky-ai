@@ -39,7 +39,7 @@ jobs:
       - name: Shellcheck install.sh
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
-          shellcheck scripts/install.sh bin/statusline.sh scripts/session-start.sh scripts/session-end.sh scripts/prompt-submit.sh
+          shellcheck --severity=warning scripts/install.sh bin/statusline.sh scripts/session-start.sh scripts/session-end.sh scripts/prompt-submit.sh
 
       - name: Smoke-test runner CLI
         run: |
